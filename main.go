@@ -104,9 +104,6 @@ func main() {
 	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
 	lsAddr := lsCmd.String("addr", "", "nomad address (e.g. http://127.0.0.1:4646)")
 
-	downloadCmd := flag.NewFlagSet("download", flag.ExitOnError)
-	downloadAddr := downloadCmd.String("addr", "", "nomad address (e.g. http://127.0.0.1:4646)")
-
 	switch os.Args[1] {
 	case "tail":
 		tailCmd.Parse(os.Args[2:])
@@ -169,75 +166,7 @@ func main() {
 		}
 		table.Render() // Send output
 	case "download":
-		cfg := nomad.DefaultConfig()
-		cfg.Address = getNomadAddr(*lsAddr)
-		client, err := nomad.NewClient(cfg)
-		if err != nil {
-			log.Fatalf("could not create nomad client: %v", err)
-		}
-
-		list, _, err := client.Allocations().List(nil)
-		if err != nil {
-			log.Fatalf("could not get allocations: %v", err)
-		}
-
-		for _, alloc := range list {
-			if alloc.ClientStatus != "running" {
-				continue
-			}
-
-			allocation, _, err := client.Allocations().Info(alloc.ID, nil)
-			if err != nil {
-				log.Printf("could not retrieve allocation %s\n", alloc.ID)
-				continue
-			}
-
-			for task, state := range allocation.TaskStates {
-				if state.State != "running" {
-					continue
-				}
-
-				stdoutFrames, stdoutErrChan := client.AllocFS().Logs(allocation, false, task, "stdout", "start", 0, nil, nil)
-				stderrFrames, stderrErrChan := client.AllocFS().Logs(allocation, false, task, "stderr", "start", 0, nil, nil)
-
-				for {
-					select {
-					case stdoutFrame, more := <-stdoutFrames:
-						if !more {
-							return nil
-						}
-						for _, line := range strings.Split(string(stdoutFrame.Data), "\n") {
-							if line == "" {
-								continue
-							}
-							lines <- logLine{jw.job, allocation, line}
-						}
-					case stderrFrame, more := <-stderrFrames:
-						if !more {
-							return nil
-						}
-						for _, line := range strings.Split(string(stderrFrame.Data), "\n") {
-							if line == "" {
-								continue
-							}
-							lines <- logLine{jw.job, allocation, line}
-						}
-					case err := <-stdoutErrChan:
-						if strings.Contains(err.Error(), "unknown task name") {
-							return nil
-						}
-						log.Printf("%s: got error (allocation probably shutting down): %s", jw.job, err)
-						return nil
-					case err := <-stderrErrChan:
-						if strings.Contains(err.Error(), "unknown task name") {
-							return nil
-						}
-						log.Printf("%s: got error (allocation probably shutting down): %s", jw.job, err)
-						return nil
-					}
-				}
-			}
-		}
+		fmt.Printf("not implemented yet\n")
 	}
 }
 

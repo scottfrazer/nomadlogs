@@ -1,4 +1,4 @@
-module github.com/stefanvanburen/nomadlogs
+module github.com/scottfrazer/nomadlogs
 
 go 1.17
 
