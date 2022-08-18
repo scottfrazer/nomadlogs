@@ -1,188 +1,332 @@
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/fatih/color"
 	nomad "github.com/hashicorp/nomad/api"
-	okrun "github.com/oklog/run"
-	"github.com/peterbourgon/ff/v3/ffcli"
+	"github.com/olekukonko/tablewriter"
 )
+
+// always prefer the value specified at the command line
+// if one isn't specified at the command line, use env var NOMAD_ADDR
+// otherwise default to nomad's default address of http://127.0.0.1:4646
+func getNomadAddr(cmdLineValue string) string {
+	nomadAddr := cmdLineValue
+	if len(nomadAddr) == 0 {
+		nomadAddr = os.Getenv("NOMAD_ADDR")
+	}
+	if len(nomadAddr) == 0 {
+		nomadAddr = nomad.DefaultConfig().Address
+	}
+	return nomadAddr
+}
+
+type nomadTask struct {
+	job  string
+	task string
+}
+
+type tailCommand struct {
+	n          string
+	follow     bool
+	nomadTasks []nomadTask
+	client     *nomad.Client
+}
+
+func (tail *tailCommand) Run() error {
+	var wg sync.WaitGroup
+	for _, task := range tail.nomadTasks {
+		wg.Add(1)
+		go func(task nomadTask) {
+			defer wg.Done()
+			watcher := NewWatcher(task.job, task.task, tail.client)
+			lines := watcher.run()
+			for line := range lines {
+				fmt.Printf("%s\n", line.Format())
+			}
+		}(task)
+	}
+	wg.Wait()
+	return nil
+}
+
+func NewTailCommand(n string, follow bool, addr string, tasks []string) (*tailCommand, error) {
+	cfg := nomad.DefaultConfig()
+	cfg.Address = addr
+	client, err := nomad.NewClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var nomadTasks []nomadTask
+	for _, task := range tasks {
+		split := strings.Split(task, ":")
+		if len(split) > 2 {
+			return nil, fmt.Errorf("expecting 'job:task' or 'task', got %s", task)
+		}
+		if len(split) == 2 {
+			nomadTasks = append(nomadTasks, nomadTask{split[0], split[1]})
+		}
+		if len(split) == 1 {
+			nomadTasks = append(nomadTasks, nomadTask{"", split[0]})
+		}
+	}
+	return &tailCommand{n, follow, nomadTasks, client}, nil
+}
+
+type allocation struct {
+	allocationId string
+	jobId        string
+	task         string
+	state        string
+	taskGroup    string
+	lastRestart  time.Time
+}
 
 func main() {
 	// write meta logs to stderr, actual program output to stdout
 	log.SetOutput(os.Stderr)
 	log.SetPrefix("nomadlogs ")
 
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		os.Exit(1)
-	}
-}
+	tailCmd := flag.NewFlagSet("tail", flag.ExitOnError)
+	tailN := tailCmd.String("n", "10", "last n lines of logs use +NUM to start at line NUM")
+	tailF := tailCmd.Bool("f", false, "follow logs")
+	tailAddr := tailCmd.String("addr", "", "nomad address (e.g. http://127.0.0.1:4646)")
 
-func run(args []string) error {
-	var (
-		rootFlagSet = flag.NewFlagSet("nomadlogs", flag.ExitOnError)
-		addr        = rootFlagSet.String("addr", nomad.DefaultConfig().Address, "nomad address")
+	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
+	lsAddr := lsCmd.String("addr", "", "nomad address (e.g. http://127.0.0.1:4646)")
 
-		watchFlagSet = flag.NewFlagSet("nomadlogs watch", flag.ExitOnError)
-		jobs         = watchFlagSet.String("jobs", "", "comma-separated list of job:task to watch")
-	)
+	downloadCmd := flag.NewFlagSet("download", flag.ExitOnError)
+	downloadAddr := downloadCmd.String("addr", "", "nomad address (e.g. http://127.0.0.1:4646)")
 
-	list := &ffcli.Command{
-		Name:       "list",
-		ShortUsage: "nomadlogs [flags] list",
-		ShortHelp:  "list jobs:allocations",
-		Exec: func(_ context.Context, _ []string) error {
-			cfg := nomad.DefaultConfig()
-			cfg.Address = *addr
-			client, err := nomad.NewClient(cfg)
-			if err != nil {
-				return fmt.Errorf("could not create nomad client: %s", err)
+	switch os.Args[1] {
+	case "tail":
+		tailCmd.Parse(os.Args[2:])
+		cmd, err := NewTailCommand(*tailN, *tailF, getNomadAddr(*tailAddr), tailCmd.Args())
+		if err != nil {
+			log.Fatalf("NewTailCommand: %v\n", err)
+		}
+		if err := cmd.Run(); err != nil {
+			log.Fatalf("Run: %v\n", err)
+		}
+	case "ls":
+		cfg := nomad.DefaultConfig()
+		cfg.Address = getNomadAddr(*lsAddr)
+		client, err := nomad.NewClient(cfg)
+		if err != nil {
+			log.Fatalf("could not create nomad client: %v", err)
+		}
+		list, _, err := client.Allocations().List(nil)
+		if err != nil {
+			log.Fatalf("could not get allocations: %v", err)
+		}
+
+		type row struct {
+			allocationId string
+			jobId        string
+			task         string
+			state        string
+			taskGroup    string
+			lastRestart  time.Time
+		}
+		var rows []row
+		for _, allocation := range list {
+			for task, state := range allocation.TaskStates {
+				rows = append(rows, row{allocation.ID, allocation.JobID, task, state.State, allocation.TaskGroup, state.LastRestart})
 			}
-			list, _, err := client.Allocations().List(nil)
-			if err != nil {
-				return fmt.Errorf("could not get allocations: %s", err)
+		}
+
+		sort.SliceStable(rows, func(i, j int) bool {
+			strI := rows[i].jobId + rows[i].task
+			strJ := rows[j].jobId + rows[j].task
+			return strI < strJ
+		})
+
+		table := tablewriter.NewWriter(os.Stdout)
+		table.SetHeader([]string{"Allocation", "Job ID", "Task", "State", "Last Restart"})
+
+		for _, row := range rows {
+			lastRestart := ""
+			if !row.lastRestart.IsZero() {
+				lastRestart = row.lastRestart.Format("2006-01-02T15:04:05")
 			}
-			for _, allocation := range list {
-				for task := range allocation.TaskStates {
-					fmt.Printf("%s:%s\n", allocation.JobID, task)
+			st := row.state
+			if row.state == "running" {
+				st = color.GreenString(row.state)
+			}
+			if row.state == "dead" {
+				st = color.RedString(row.state)
+			}
+			table.Append([]string{row.allocationId[:8], row.jobId, row.task, st, lastRestart})
+		}
+		table.Render() // Send output
+	case "download":
+		cfg := nomad.DefaultConfig()
+		cfg.Address = getNomadAddr(*lsAddr)
+		client, err := nomad.NewClient(cfg)
+		if err != nil {
+			log.Fatalf("could not create nomad client: %v", err)
+		}
+
+		list, _, err := client.Allocations().List(nil)
+		if err != nil {
+			log.Fatalf("could not get allocations: %v", err)
+		}
+
+		for _, alloc := range list {
+			if alloc.ClientStatus != "running" {
+				continue
+			}
+
+			allocation, _, err := client.Allocations().Info(alloc.ID, nil)
+			if err != nil {
+				log.Printf("could not retrieve allocation %s\n", alloc.ID)
+				continue
+			}
+
+			for task, state := range allocation.TaskStates {
+				if state.State != "running" {
+					continue
 				}
-			}
-			return nil
-		},
-	}
 
-	watch := &ffcli.Command{
-		Name:       "watch",
-		ShortUsage: "nomadlogs [flags] watch -jobs <job-a>:<allocation-a>",
-		ShortHelp:  "watch jobs:allocations",
-		FlagSet:    watchFlagSet,
-		Exec: func(_ context.Context, _ []string) error {
-			cfg := nomad.DefaultConfig()
-			cfg.Address = *addr
+				stdoutFrames, stdoutErrChan := client.AllocFS().Logs(allocation, false, task, "stdout", "start", 0, nil, nil)
+				stderrFrames, stderrErrChan := client.AllocFS().Logs(allocation, false, task, "stderr", "start", 0, nil, nil)
 
-			client, err := nomad.NewClient(cfg)
-			if err != nil {
-				return fmt.Errorf("could not create nomad client: %s", err)
-			}
-
-			var g okrun.Group
-			for _, jobToTask := range strings.Split(*jobs, ",") {
-				s := strings.Split(jobToTask, ":")
-				if len(s) != 2 {
-					return fmt.Errorf("jobs must be specified in the format job:task")
-				}
-
-				job, task := s[0], s[1]
-
-				g.Add(func() error {
-					jw := jobWatcher{
-						job:    job,
-						task:   task,
-						client: client,
-
-						allocationsWatched: map[string]struct{}{},
+				for {
+					select {
+					case stdoutFrame, more := <-stdoutFrames:
+						if !more {
+							return nil
+						}
+						for _, line := range strings.Split(string(stdoutFrame.Data), "\n") {
+							if line == "" {
+								continue
+							}
+							lines <- logLine{jw.job, allocation, line}
+						}
+					case stderrFrame, more := <-stderrFrames:
+						if !more {
+							return nil
+						}
+						for _, line := range strings.Split(string(stderrFrame.Data), "\n") {
+							if line == "" {
+								continue
+							}
+							lines <- logLine{jw.job, allocation, line}
+						}
+					case err := <-stdoutErrChan:
+						if strings.Contains(err.Error(), "unknown task name") {
+							return nil
+						}
+						log.Printf("%s: got error (allocation probably shutting down): %s", jw.job, err)
+						return nil
+					case err := <-stderrErrChan:
+						if strings.Contains(err.Error(), "unknown task name") {
+							return nil
+						}
+						log.Printf("%s: got error (allocation probably shutting down): %s", jw.job, err)
+						return nil
 					}
-
-					return jw.run()
-				}, func(error) {
-
-				})
+				}
 			}
-
-			if err := g.Run(); err != nil {
-				return fmt.Errorf("got error: %s", err)
-			}
-
-			return nil
-		},
+		}
 	}
-
-	root := &ffcli.Command{
-		ShortUsage:  "nomadlogs [flags] <subcommand>",
-		FlagSet:     rootFlagSet,
-		Subcommands: []*ffcli.Command{watch, list},
-	}
-
-	if err := root.ParseAndRun(context.Background(), args); err != nil {
-		return err
-	}
-
-	return nil
 }
 
-type jobWatcher struct {
-	job    string
-	task   string
-	client *nomad.Client
+type logLine struct {
+	job        string
+	allocation *nomad.Allocation
+	line       string
+}
 
+func (line logLine) Format() string {
+	var parsed struct {
+		Level   string    `json:"level"`
+		Time    time.Time `json:"time"`
+		Message string    `json:"message"`
+		TraceId string    `json:"trace.id,omitempty"`
+	}
+	err := json.Unmarshal([]byte(line.line), &parsed)
+	formatted := line.line
+	if err == nil {
+		formatted = fmt.Sprintf("[%s] [%s] %s", parsed.Time.Format("2006-01-02T15:04:05Z"), parsed.Level, parsed.Message)
+	}
+
+	return fmt.Sprintf("%s(%s): %s", color.CyanString(*line.allocation.Job.Name), color.GreenString(line.allocation.ID[:8]), formatted)
+}
+
+type watcher struct {
+	job                string
+	task               string
+	client             *nomad.Client
 	mu                 sync.Mutex
 	allocationsWatched map[string]struct{}
+	pollInterval       time.Duration
 }
 
-const waitDuration = 5 * time.Second
+func NewWatcher(job, task string, client *nomad.Client) *watcher {
+	return &watcher{job, task, client, sync.Mutex{}, make(map[string]struct{}), time.Second * 5}
+}
 
-func (jw *jobWatcher) run() error {
-	log.Printf("watching job %s, task %s", jw.job, jw.task)
+func (jw *watcher) run() chan logLine {
+	lines := make(chan logLine, 1000)
+	go jw.poll(lines)
+	return lines
+}
 
-	for range time.Tick(waitDuration) {
+func (jw *watcher) poll(lines chan logLine) {
+	for range time.Tick(jw.pollInterval) {
 		allocationList, _, err := jw.client.Allocations().List(nil)
 		if err != nil {
-			log.Printf("could not list nomad allocations. waiting %s before trying again: %s", waitDuration, err)
+			log.Printf("could not list nomad allocations. waiting %s before trying again: %s", jw.pollInterval, err)
 			continue
 		}
 
-		allocationIDsForJob := []string{}
-		for _, allocationStub := range allocationList {
-			if allocationStub.JobID == jw.job && allocationStub.ClientStatus == "running" {
-				allocationIDsForJob = append(allocationIDsForJob, allocationStub.ID)
+		for _, alloc := range allocationList {
+			if _, ok := jw.allocationsWatched[alloc.ID]; ok {
+				continue
 			}
-		}
-
-		if len(allocationIDsForJob) == 0 {
-			log.Printf("no allocations running for %s; waiting for %s before trying again", jw.job, waitDuration)
-			continue
-		}
-
-		for _, allocationID := range allocationIDsForJob {
-			if _, alreadyWatching := jw.allocationsWatched[allocationID]; alreadyWatching {
+			if _, ok := alloc.TaskStates[jw.task]; !ok {
+				continue
+			}
+			if jw.job != "" && jw.job != alloc.JobID {
+				continue
+			}
+			if alloc.ClientStatus != "running" {
 				continue
 			}
 
-			allocation, _, err := jw.client.Allocations().Info(allocationID, nil)
+			allocation, _, err := jw.client.Allocations().Info(alloc.ID, nil)
 			if err != nil {
-				// The allocation probably went away before we could query it
-				// specifically.
-				log.Printf("could not retrieve allocation %s", allocationID)
+				log.Printf("could not retrieve allocation %s\n", alloc.ID)
 				continue
 			}
 
-			go func(allocationID string) {
+			go func(allocation *nomad.Allocation) {
 				jw.mu.Lock()
-				jw.allocationsWatched[allocationID] = struct{}{}
+				jw.allocationsWatched[allocation.ID] = struct{}{}
 				jw.mu.Unlock()
 
 				// watch the stream until it's done
-				jw.watchAllocationLogs(allocation)
+				jw.watchAllocationLogs(allocation, lines)
 
 				jw.mu.Lock()
-				delete(jw.allocationsWatched, allocationID)
+				delete(jw.allocationsWatched, allocation.ID)
 				jw.mu.Unlock()
-			}(allocationID)
+			}(allocation)
 		}
 	}
-
-	return nil
 }
 
-func (jw *jobWatcher) watchAllocationLogs(allocation *nomad.Allocation) error {
+func (jw *watcher) watchAllocationLogs(allocation *nomad.Allocation, lines chan logLine) error {
 	stdoutFrames, stdoutErrChan := jw.client.AllocFS().Logs(allocation, true, jw.task, "stdout", "end", 0, nil, nil)
 	stderrFrames, stderrErrChan := jw.client.AllocFS().Logs(allocation, true, jw.task, "stderr", "end", 0, nil, nil)
 
@@ -190,30 +334,36 @@ func (jw *jobWatcher) watchAllocationLogs(allocation *nomad.Allocation) error {
 		select {
 		case stdoutFrame, more := <-stdoutFrames:
 			if !more {
-				log.Printf("stdoutFrames closed!")
+				lines <- logLine{jw.job, allocation, "stdoutFrames closed!"}
 				return nil
 			}
 			for _, line := range strings.Split(string(stdoutFrame.Data), "\n") {
 				if line == "" {
 					continue
 				}
-				fmt.Printf("%s(%s): %s\n", jw.job, allocation.ID[:6], line)
+				lines <- logLine{jw.job, allocation, line}
 			}
 		case stderrFrame, more := <-stderrFrames:
 			if !more {
-				log.Printf("stderrFrames closed!")
+				lines <- logLine{jw.job, allocation, "stderrFrames closed!"}
 				return nil
 			}
 			for _, line := range strings.Split(string(stderrFrame.Data), "\n") {
 				if line == "" {
 					continue
 				}
-				fmt.Printf("%s(%s): %s\n", jw.job, allocation.ID[:6], line)
+				lines <- logLine{jw.job, allocation, line}
 			}
 		case err := <-stdoutErrChan:
+			if strings.Contains(err.Error(), "unknown task name") {
+				return nil
+			}
 			log.Printf("%s: got error (allocation probably shutting down): %s", jw.job, err)
 			return nil
 		case err := <-stderrErrChan:
+			if strings.Contains(err.Error(), "unknown task name") {
+				return nil
+			}
 			log.Printf("%s: got error (allocation probably shutting down): %s", jw.job, err)
 			return nil
 		}
