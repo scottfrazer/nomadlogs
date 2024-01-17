@@ -104,6 +104,11 @@ func main() {
 	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
 	lsAddr := lsCmd.String("addr", "", "nomad address (e.g. http://127.0.0.1:4646)")
 
+	if len(os.Args) < 2 {
+		tailCmd.PrintDefaults()
+		os.Exit(1)
+	}
+
 	switch os.Args[1] {
 	case "tail":
 		tailCmd.Parse(os.Args[2:])
