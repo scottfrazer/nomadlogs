@@ -16,6 +16,13 @@ import (
 	"github.com/olekukonko/tablewriter"
 )
 
+const usage = "usage: nomadlogs [tail|ls] [flags] [job:task]...\n"
+
+func printUsageAndExit() {
+	fmt.Printf(usage)
+	os.Exit(1)
+}
+
 // always prefer the value specified at the command line
 // if one isn't specified at the command line, use env var NOMAD_ADDR
 // otherwise default to nomad's default address of http://127.0.0.1:4646
@@ -67,6 +74,9 @@ func NewTailCommand(n string, follow bool, addr string, tasks []string) (*tailCo
 		return nil, err
 	}
 	var nomadTasks []nomadTask
+	if len(tasks) == 0 {
+		return nil, fmt.Errorf("no tasks specified.\nUse 'nomadlogs tail [task]', or 'nomadlogs ls' to find tasks")
+	}
 	for _, task := range tasks {
 		split := strings.Split(task, ":")
 		if len(split) > 2 {
@@ -104,9 +114,10 @@ func main() {
 	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
 	lsAddr := lsCmd.String("addr", "", "nomad address (e.g. http://127.0.0.1:4646)")
 
+	flag.Parse()
+
 	if len(os.Args) < 2 {
-		tailCmd.PrintDefaults()
-		os.Exit(1)
+		printUsageAndExit()
 	}
 
 	switch os.Args[1] {
@@ -172,6 +183,8 @@ func main() {
 		table.Render() // Send output
 	case "download":
 		fmt.Printf("not implemented yet\n")
+	default:
+		printUsageAndExit()
 	}
 }
 
