@@ -16,25 +16,36 @@ import (
 	"github.com/olekukonko/tablewriter"
 )
 
-const usage = "usage: nomadlogs [tail|ls] [flags] [job:task]...\n"
+const usage = "Usage: nomadlogs [ls | tail] [flags] [job:task]...\n" +
+	"  nomadlogs tail -h\n" +
+	"  nomadlogs ls -h\n"
 
 func printUsageAndExit() {
 	fmt.Printf(usage)
 	os.Exit(1)
 }
 
-// always prefer the value specified at the command line
-// if one isn't specified at the command line, use env var NOMAD_ADDR
-// otherwise default to nomad's default address of http://127.0.0.1:4646
-func getNomadAddr(cmdLineValue string) string {
-	nomadAddr := cmdLineValue
-	if len(nomadAddr) == 0 {
-		nomadAddr = os.Getenv("NOMAD_ADDR")
+var (
+	tailCmd = flag.NewFlagSet("tail", flag.ExitOnError)
+	lsCmd   = flag.NewFlagSet("ls", flag.ExitOnError)
+)
+
+func printTailUsage() {
+	fmt.Println("Usage of tail:")
+	fmt.Println("  nomadlogs tail [flags] [job:task]...")
+	fmt.Println("Flags:")
+	if tailCmd != nil {
+		tailCmd.PrintDefaults()
 	}
-	if len(nomadAddr) == 0 {
-		nomadAddr = nomad.DefaultConfig().Address
+}
+
+func printLsUsage() {
+	fmt.Println("Usage of ls:")
+	fmt.Println("  nomadlogs ls [flags]")
+	fmt.Println("Flags:")
+	if lsCmd != nil {
+		lsCmd.PrintDefaults()
 	}
-	return nomadAddr
 }
 
 type nomadTask struct {
@@ -80,7 +91,7 @@ func NewTailCommand(n string, follow bool, addr string, isRaw bool, tasks []stri
 	}
 	var nomadTasks []nomadTask
 	if len(tasks) == 0 {
-		return nil, fmt.Errorf("no tasks specified.\nUse 'nomadlogs tail [task]', or 'nomadlogs ls' to find tasks")
+		return nil, fmt.Errorf("no tasks specified")
 	}
 	for _, task := range tasks {
 		split := strings.Split(task, ":")
@@ -111,14 +122,14 @@ func main() {
 	log.SetOutput(os.Stderr)
 	log.SetPrefix("nomadlogs ")
 
-	tailCmd := flag.NewFlagSet("tail", flag.ExitOnError)
+	tailCmd.Usage = printTailUsage
 	tailN := tailCmd.String("n", "10", "last n lines of logs use +NUM to start at line NUM")
 	tailF := tailCmd.Bool("f", false, "follow logs")
-	tailAddr := tailCmd.String("addr", "", "nomad address (e.g. http://127.0.0.1:4646)")
-	tailRaw := tailCmd.Bool("raw", false, "Raw logs are JSON and not formatted")
+	tailAddr := tailCmd.String("addr", nomad.DefaultConfig().Address, "nomad address (also set via NOMAD_ADDR env var)\n")
+	tailJson := tailCmd.Bool("json", false, "logs output as JSON")
 
-	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
-	lsAddr := lsCmd.String("addr", "", "nomad address (e.g. http://127.0.0.1:4646)")
+	lsCmd.Usage = printLsUsage
+	lsAddr := lsCmd.String("addr", nomad.DefaultConfig().Address, "nomad address (also set via NOMAD_ADDR env var)\n")
 
 	flag.Parse()
 
@@ -128,17 +139,28 @@ func main() {
 
 	switch os.Args[1] {
 	case "tail":
-		tailCmd.Parse(os.Args[2:])
-		cmd, err := NewTailCommand(*tailN, *tailF, getNomadAddr(*tailAddr), *tailRaw, tailCmd.Args())
+		err := tailCmd.Parse(os.Args[2:])
 		if err != nil {
-			log.Fatalf("NewTailCommand: %v\n", err)
+			tailCmd.Usage()
+			os.Exit(1)
+		}
+		cmd, err := NewTailCommand(*tailN, *tailF, *tailAddr, *tailJson, tailCmd.Args())
+		if err != nil {
+			log.Printf("NewTailCommand: %v\n\n", err)
+			tailCmd.Usage()
+			os.Exit(1)
 		}
 		if err := cmd.Run(); err != nil {
 			log.Fatalf("Run: %v\n", err)
 		}
 	case "ls":
+		err := lsCmd.Parse(os.Args[2:])
+		if err != nil {
+			lsCmd.Usage()
+			os.Exit(1)
+		}
 		cfg := nomad.DefaultConfig()
-		cfg.Address = getNomadAddr(*lsAddr)
+		cfg.Address = *lsAddr
 		client, err := nomad.NewClient(cfg)
 		if err != nil {
 			log.Fatalf("could not create nomad client: %v", err)
