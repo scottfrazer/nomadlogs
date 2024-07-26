@@ -47,6 +47,7 @@ type tailCommand struct {
 	follow     bool
 	nomadTasks []nomadTask
 	client     *nomad.Client
+	rawFormat  bool
 }
 
 func (tail *tailCommand) Run() error {
@@ -58,7 +59,11 @@ func (tail *tailCommand) Run() error {
 			watcher := NewWatcher(task.job, task.task, tail.client)
 			lines := watcher.run()
 			for line := range lines {
-				fmt.Printf("%s\n", line.Format())
+				if tail.rawFormat {
+					fmt.Println(line.line)
+				} else {
+					fmt.Printf("%s\n", line.Format())
+				}
 			}
 		}(task)
 	}
@@ -66,7 +71,7 @@ func (tail *tailCommand) Run() error {
 	return nil
 }
 
-func NewTailCommand(n string, follow bool, addr string, tasks []string) (*tailCommand, error) {
+func NewTailCommand(n string, follow bool, addr string, isRaw bool, tasks []string) (*tailCommand, error) {
 	cfg := nomad.DefaultConfig()
 	cfg.Address = addr
 	client, err := nomad.NewClient(cfg)
@@ -89,7 +94,7 @@ func NewTailCommand(n string, follow bool, addr string, tasks []string) (*tailCo
 			nomadTasks = append(nomadTasks, nomadTask{"", split[0]})
 		}
 	}
-	return &tailCommand{n, follow, nomadTasks, client}, nil
+	return &tailCommand{n, follow, nomadTasks, client, isRaw}, nil
 }
 
 type allocation struct {
@@ -110,6 +115,7 @@ func main() {
 	tailN := tailCmd.String("n", "10", "last n lines of logs use +NUM to start at line NUM")
 	tailF := tailCmd.Bool("f", false, "follow logs")
 	tailAddr := tailCmd.String("addr", "", "nomad address (e.g. http://127.0.0.1:4646)")
+	tailRaw := tailCmd.Bool("raw", false, "Raw logs are JSON and not formatted")
 
 	lsCmd := flag.NewFlagSet("ls", flag.ExitOnError)
 	lsAddr := lsCmd.String("addr", "", "nomad address (e.g. http://127.0.0.1:4646)")
@@ -123,7 +129,7 @@ func main() {
 	switch os.Args[1] {
 	case "tail":
 		tailCmd.Parse(os.Args[2:])
-		cmd, err := NewTailCommand(*tailN, *tailF, getNomadAddr(*tailAddr), tailCmd.Args())
+		cmd, err := NewTailCommand(*tailN, *tailF, getNomadAddr(*tailAddr), *tailRaw, tailCmd.Args())
 		if err != nil {
 			log.Fatalf("NewTailCommand: %v\n", err)
 		}
