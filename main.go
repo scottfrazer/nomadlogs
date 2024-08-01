@@ -58,7 +58,7 @@ type tailCommand struct {
 	follow     bool
 	nomadTasks []nomadTask
 	client     *nomad.Client
-	rawFormat  bool
+	jsonFormat bool
 }
 
 func (tail *tailCommand) Run() error {
@@ -70,8 +70,8 @@ func (tail *tailCommand) Run() error {
 			watcher := NewWatcher(task.job, task.task, tail.client)
 			lines := watcher.run()
 			for line := range lines {
-				if tail.rawFormat {
-					fmt.Println(line.line)
+				if tail.jsonFormat {
+					fmt.Printf("%s\n", line.JSONFormat())
 				} else {
 					fmt.Printf("%s\n", line.Format())
 				}
@@ -82,7 +82,7 @@ func (tail *tailCommand) Run() error {
 	return nil
 }
 
-func NewTailCommand(n string, follow bool, addr string, isRaw bool, tasks []string) (*tailCommand, error) {
+func NewTailCommand(n string, follow bool, addr string, jsonFormat bool, tasks []string) (*tailCommand, error) {
 	cfg := nomad.DefaultConfig()
 	cfg.Address = addr
 	client, err := nomad.NewClient(cfg)
@@ -105,7 +105,7 @@ func NewTailCommand(n string, follow bool, addr string, isRaw bool, tasks []stri
 			nomadTasks = append(nomadTasks, nomadTask{"", split[0]})
 		}
 	}
-	return &tailCommand{n, follow, nomadTasks, client, isRaw}, nil
+	return &tailCommand{n, follow, nomadTasks, client, jsonFormat}, nil
 }
 
 type allocation struct {
@@ -236,6 +236,39 @@ func (line logLine) Format() string {
 	}
 
 	return fmt.Sprintf("%s(%s): %s", color.CyanString(*line.allocation.Job.Name), color.GreenString(line.allocation.ID[:8]), formatted)
+}
+
+func (line logLine) JSONFormat() string {
+	var (
+		l map[string]interface{}
+	)
+
+	err := json.Unmarshal([]byte(line.line), &l)
+	if err != nil {
+		log.Printf("JSONFormat error unmarshalling line to JSON: %v\n", err)
+		return line.Format()
+	}
+
+	nomadAttrs := map[string]interface{}{
+		"allocation": map[string]interface{}{
+			"id":     line.allocation.ID,
+			"name":   line.allocation.Name,
+			"status": line.allocation.ClientStatus,
+		},
+		"job": map[string]interface{}{
+			"name": line.allocation.Job.Name,
+			"type": line.allocation.Job.Type,
+		},
+	}
+	l["nomad"] = nomadAttrs
+
+	newLine, err := json.Marshal(l)
+	if err != nil {
+		log.Printf("JSONFormat error re-marshalling line to JSON: %v\n", err)
+		return line.Format()
+	}
+
+	return string(newLine)
 }
 
 type watcher struct {
