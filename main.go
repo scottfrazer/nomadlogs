@@ -70,6 +70,10 @@ func (tail *tailCommand) Run() error {
 			watcher := NewWatcher(task.job, task.task, tail.client)
 			lines := watcher.run()
 			for line := range lines {
+				if line.line == "" {
+					continue
+				}
+
 				if tail.jsonFormat {
 					fmt.Printf("%s\n", line.JSONFormat())
 				} else {
@@ -245,8 +249,9 @@ func (line logLine) JSONFormat() string {
 
 	err := json.Unmarshal([]byte(line.line), &l)
 	if err != nil {
-		log.Printf("JSONFormat error unmarshalling line to JSON: %v\n", err)
-		return line.Format()
+		log.Printf("JSONFormat unmarshal %s (%s) '%s' err: (%v)\n",
+			*line.allocation.Job.Name, line.allocation.ID[:8], line.line, err)
+		return line.line
 	}
 
 	nomadAttrs := map[string]interface{}{
@@ -264,8 +269,9 @@ func (line logLine) JSONFormat() string {
 
 	newLine, err := json.Marshal(l)
 	if err != nil {
-		log.Printf("JSONFormat error re-marshalling line to JSON: %v\n", err)
-		return line.Format()
+		log.Printf("JSONFormat re-marshal %s (%s) '%s' err: (%v)\n",
+			*line.allocation.Job.Name, line.allocation.ID[:8], line.line, err)
+		return line.line
 	}
 
 	return string(newLine)
@@ -334,34 +340,63 @@ func (jw *watcher) poll(lines chan logLine) {
 	}
 }
 
+// handleFrame each frame is a chunk of a log file, where the first and last lines might not be complete
+// JSON objects. We do our best to recombine split lines so they can be parsed as JSON.
+// The first frame's first line might not be rescuable, but we'll try to recombine the rest by taking the
+// prior frame's last line and concatenating it to the current frame's first line.
+func (jw *watcher) handleFrame(frame *nomad.StreamFrame, allocation *nomad.Allocation, lines chan logLine, previous *string) {
+
+	firstLine := true // use instead of i to handle blank lines
+	for _, line := range strings.Split(string(frame.Data), "\n") {
+		if line == "" {
+			continue
+		}
+
+		if firstLine {
+			*previous += line
+			firstLine = false
+			continue
+		}
+
+		lines <- logLine{jw.job, allocation, *previous}
+		*previous = line
+	}
+
+	// if the last line of the file is a complete JSON object send it, otherwise
+	// hold onto it for the next frame
+	if strings.HasSuffix(*previous, "}") {
+		lines <- logLine{jw.job, allocation, *previous}
+		*previous = ""
+	}
+}
+
 func (jw *watcher) watchAllocationLogs(allocation *nomad.Allocation, lines chan logLine) error {
 	stdoutFrames, stdoutErrChan := jw.client.AllocFS().Logs(allocation, true, jw.task, "stdout", "end", 0, nil, nil)
 	stderrFrames, stderrErrChan := jw.client.AllocFS().Logs(allocation, true, jw.task, "stderr", "end", 0, nil, nil)
 
+	var (
+		prevLineStdout string
+		prevLineStderr string
+	)
+
 	for {
 		select {
-		case stdoutFrame, more := <-stdoutFrames:
+		case frame, more := <-stdoutFrames:
 			if !more {
-				lines <- logLine{jw.job, allocation, "stdoutFrames closed!"}
+				log.Printf("stdoutFrames closed! %s %s %s %d\n",
+					*allocation.Job.Name, allocation.ID, frame.File, frame.Offset)
 				return nil
 			}
-			for _, line := range strings.Split(string(stdoutFrame.Data), "\n") {
-				if line == "" {
-					continue
-				}
-				lines <- logLine{jw.job, allocation, line}
-			}
-		case stderrFrame, more := <-stderrFrames:
+			jw.handleFrame(frame, allocation, lines, &prevLineStdout)
+
+		case frame, more := <-stderrFrames:
 			if !more {
-				lines <- logLine{jw.job, allocation, "stderrFrames closed!"}
+				log.Printf("stderrFrames closed! %s %s %s %d\n",
+					*allocation.Job.Name, allocation.ID, frame.File, frame.Offset)
 				return nil
 			}
-			for _, line := range strings.Split(string(stderrFrame.Data), "\n") {
-				if line == "" {
-					continue
-				}
-				lines <- logLine{jw.job, allocation, line}
-			}
+			jw.handleFrame(frame, allocation, lines, &prevLineStderr)
+
 		case err := <-stdoutErrChan:
 			if strings.Contains(err.Error(), "unknown task name") {
 				return nil
